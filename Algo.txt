@@ -1,0 +1,160 @@
+ALGORITHM: HEFT-Seeded NSGA-II Workflow Scheduling Algorithm
+
+INPUT: workflow, vm_types, resource_pool, parameters
+OUTPUT: pareto_front (set of non-dominated schedules)
+
+FUNCTION HEFT_Schedule(workflow, resource_pool, vm_types):
+    compute average_execution_time_per_task = for each task: avg(base_runtime / vm_type.speed_factor)
+    compute upward_rank for each task (recursive):
+        if task has no children: upward_rank = avg_execution_time
+        else: upward_rank = avg_execution_time + max( communication_cost + upward_rank(child) for child in children )
+    order tasks by descending upward_rank
+    initialize resource_available_time[r] = 0 for each resource r
+    for task in ordered_tasks:
+        for r in resource_pool:
+            est = max(resource_available_time[r], max(finish_time[parent] for parent in parents_of(task) or 0))
+            exec_time = task.base_runtime / vm_types[r.type].speed_factor
+            eft[r] = est + exec_time
+        pick r* with minimal eft
+        set start_time[task] = corresponding est
+        set finish_time[task] = eft[r*]
+        update resource_available_time[r*] = finish_time[task]
+        record assignment task->r*
+    return chromosome_from_assignments_and_priority_list(assignments, ordered_tasks)
+
+FUNCTION Perturb(chromosome, strength):
+    for i in 1..strength:
+        pick random task t
+        pick random resource r
+        chromosome.assignment_array[t_index] = r
+        swap two random positions in chromosome.priority_list with small probability
+    return chromosome
+
+FUNCTION Random_Chromosome(workflow, resource_pool):
+    assignment_array = for each task pick random resource from resource_pool
+    priority_list = topological_sort(workflow) then shuffle preserving parent-before-child
+    return chromosome
+
+FUNCTION Decode_And_Evaluate(chromosome):
+    apply decoding_model.decode_steps to produce schedule
+    makespan = computed makespan
+    cost = computed cost
+    deadline_violation = computed_deadline_penalty
+    return objectives = (makespan, cost, deadline_violation), schedule, chromosome
+
+FUNCTION Repair(chromosome):
+    attempts = 0
+    while attempts < parameters.repair_max_attempts:
+        if priority_list has no cycles and all parents before children:
+            break
+        fix order by performing topological correction: move parents earlier than children
+        for any assignment to missing resource: reassign to random resource
+        attempts += 1
+    return chromosome
+
+FUNCTION FastNonDominatedSort(population):
+    front = []
+    for p in population:
+        S[p] = []
+        n[p] = 0
+    for p in population:
+        for q in population:
+            if dominates(p.objectives, q.objectives):
+                add q to S[p]
+            else if dominates(q.objectives, p.objectives):
+                n[p] += 1
+        if n[p] == 0:
+            p.rank = 1
+            add p to front[1]
+    i = 1
+    while front[i] not empty:
+        Q = []
+        for p in front[i]:
+            for q in S[p]:
+                n[q] -= 1
+                if n[q] == 0:
+                    q.rank = i + 1
+                    add q to Q
+        i += 1
+        front[i] = Q
+    return front
+
+FUNCTION CrowdingDistanceAssignment(front):
+    for each individual in front:
+        distance[individual] = 0
+    for m in number_of_objectives:
+        sort front by objective m ascending
+        distance[first] = distance[last] = infinity
+        for i = 2 to len(front)-1:
+            distance[front[i]] += (front[i+1].obj[m] - front[i-1].obj[m]) / (max_obj_m - min_obj_m)
+    return distance
+
+FUNCTION BinaryTournamentSelection(population):
+    a = random_choice(population)
+    b = random_choice(population)
+    if a.rank < b.rank: return a
+    if b.rank < a.rank: return b
+    if distance[a] > distance[b]: return a
+    else: return b
+
+FUNCTION Crossover(parent1, parent2):
+    if random() > parameters.crossover_rate: return copy(parent1), copy(parent2)
+    point = random integer between 1 and num_tasks-1
+    child1.assignment = parent1.assignment[0:point] + parent2.assignment[point:]
+    child2.assignment = parent2.assignment[0:point] + parent1.assignment[point:]
+    child1.priority_list = offspring_priority_merge(parent1.priority_list, parent2.priority_list)
+    child2.priority_list = offspring_priority_merge(parent2.priority_list, parent1.priority_list)
+    return child1, child2
+
+FUNCTION Mutation(chromosome):
+    for each task_index in 0..num_tasks-1:
+        if random() < parameters.mutation_rate:
+            chromosome.assignment_array[task_index] = random_resource()
+    if random() < parameters.mutation_rate:
+        swap two entries in chromosome.priority_list that do not violate DAG precedence heavily
+    return chromosome
+
+MAIN:
+    set random seed parameters.random_seed
+    population = []
+    heft_seeds = []
+    for i in 1..parameters.heft_seed_count:
+        h = HEFT_Schedule(workflow, resource_pool, vm_types)
+        add h to heft_seeds
+        for j in 1..parameters.heft_perturbations_per_seed:
+            p = Perturb(h, strength=1)
+            add p to population
+    while size(population) < parameters.population_size:
+        add Random_Chromosome(workflow, resource_pool) to population
+    for individual in population:
+        individual = Repair(individual)
+        individual.objectives, individual.schedule, _ = Decode_And_Evaluate(individual)
+    for gen in 1..parameters.generations:
+        parent_population = population
+        offspring = []
+        while len(offspring) < parameters.population_size:
+            p1 = BinaryTournamentSelection(parent_population)
+            p2 = BinaryTournamentSelection(parent_population)
+            c1, c2 = Crossover(p1, p2)
+            c1 = Mutation(c1)
+            c2 = Mutation(c2)
+            c1 = Repair(c1)
+            c2 = Repair(c2)
+            c1.objectives, c1.schedule, _ = Decode_And_Evaluate(c1)
+            c2.objectives, c2.schedule, _ = Decode_And_Evaluate(c2)
+            append c1, c2 to offspring
+        combined = parent_population + offspring
+        fronts = FastNonDominatedSort(combined)
+        new_population = []
+        i = 1
+        while len(new_population) + len(fronts[i]) <= parameters.population_size:
+            assign crowding distances for fronts[i]
+            add all individuals from fronts[i] to new_population
+            i += 1
+        assign crowding distances for fronts[i]
+        sort fronts[i] by descending crowding distance
+        fill remaining slots in new_population with top individuals from fronts[i] by crowding distance
+        population = new_population
+    final_fronts = FastNonDominatedSort(population)
+    pareto_front = final_fronts[1]
+    return pareto_front
